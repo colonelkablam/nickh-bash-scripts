@@ -1,15 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # DESC: Simple Home Folder Backup Manager with TUI interface.
 # Backs up selected folders/files in ~/ to individually compressed .tar.gz files.
 # Each backup is stored in /media/nickh/Backup/Home-Backups/YYYY-MM-DD-HH-MM-SS/
-# Backup selections, timestamps, and known items are saved as dotfiles in ~
-
-BACKUP_DEST="/media/nickh/Backup/Home-Backups"
-CONFIG_FILE="$HOME/.home-backup-config"
-TIMESTAMP_FILE="$HOME/.home-backup-timestamps"
-KNOWN_FILE="$HOME/.home-backup-known"
-TIMESTAMP=$(date "+%Y-%m-%d-%H-%M-%S")
+# Backup selections are in XDG config; state (timestamps + seen items) is merged into one file.
 
 # Colour codes
 YELLOW=$(tput setaf 3)
@@ -19,36 +13,47 @@ RESET=$(tput sgr0)
 GREEN=$(tput setaf 2)
 RED=$(tput setaf 1)
 GREY=$(tput setaf 7)
-DIM=$(tput dim)
 
+# XDG-style directories (with fallbacks)
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+BASE_NAME="home-backup"
 
-# Ensure necessary files and folders exist
-mkdir -p "$BACKUP_DEST"
-touch "$CONFIG_FILE" "$TIMESTAMP_FILE"
+# Paths
+CONFIG_DIR="$XDG_CONFIG_HOME/$BASE_NAME"
+STATE_DIR="$XDG_STATE_HOME/$BASE_NAME"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_FILE="$STATE_DIR/state"
+BACKUP_DEST="/media/nickh/Backup/Home-Backups"
+TIMESTAMP=$(date "+%Y-%m-%d-%H-%M-%S")
 
-if [[ ! -f "$KNOWN_FILE" ]]; then
-  echo "${YELLOW}ℹ️ Creating $KNOWN_FILE to track seen files/folders.${RESET}"
-  echo "${YELLOW}This file tracks which files/folders have already appeared in your home folder.${RESET}"
-  touch "$KNOWN_FILE"
-fi
+# Ensure necessary directories and files exist
+mkdir -p "$BACKUP_DEST" "$CONFIG_DIR" "$STATE_DIR"
+touch "$CONFIG_FILE" "$STATE_FILE"
 
 # Load backup selections from config file
 declare -A TO_BACKUP
 while IFS="=" read -r key val; do
-  TO_BACKUP["$key"]="$val"
+  [[ -n "$key" ]] && TO_BACKUP["$key"]="$val"
 done < "$CONFIG_FILE"
 
-# Load last backup timestamps
+# Load state (timestamps & seen items) from state file
 declare -A LAST_BACKUP
-while IFS="=" read -r key val; do
-  LAST_BACKUP["$key"]="$val"
-done < "$TIMESTAMP_FILE"
-
-# Load previously seen items
 declare -A KNOWN_ITEMS
-while read -r line; do
-  [[ -n "$line" ]] && KNOWN_ITEMS["$line"]=1
-done < "$KNOWN_FILE"
+while IFS= read -r line; do
+  case "$line" in
+    last_backup:*)
+      pair=${line#last_backup:}
+      key=${pair%%=*}
+      val=${pair#*=}
+      LAST_BACKUP["$key"]="$val"
+      ;;
+    seen_item:*)
+      item=${line#seen_item:}
+      KNOWN_ITEMS["$item"]=1
+      ;;
+  esac
+done < "$STATE_FILE"
 
 # Get top-level files/folders in home directory
 mapfile -t HOME_ITEMS < <(find "$HOME" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort)
@@ -63,7 +68,7 @@ if [[ ! -s "$CONFIG_FILE" ]]; then
         TO_BACKUP["$item"]="true" ;;
       Videos|Music|Downloads)
         TO_BACKUP["$item"]="false" ;;
-      .cache|snap|.gnome|.bashrc|.bash_logout|.bash_history|.profile|.pam_environment|.lesshst|.sudo_as_admin_successful|.home-backup-config|.home-backup-timestamps|.home-backup-known)
+      .cache|snap|.gnome|.bashrc|.bash_logout|.bash_history|.profile|.pam_environment|.lesshst|.sudo_as_admin_successful)
         TO_BACKUP["$item"]="false" ;;
       *) TO_BACKUP["$item"]="false" ;;
     esac
@@ -110,9 +115,9 @@ while true; do
     if [[ -z "${KNOWN_ITEMS[$item]}" ]]; then
       printf "${BRIGHT_YELLOW} %-3s │ %-30s %1s │ %8s │  %-5s │ %-19s${RESET}\n" "$((i+1))" "$item" "$marker" "$size_disp" "$status" "$last" 
     elif [[ "${TO_BACKUP[$item]}" != "true" ]]; then
-                printf "${DIM} %-3s │ %-30s %1s │ %8s │  %-5s │ %-19s${RESET}\n" "$((i+1))" "$item" "$marker" "$size_disp" "$status" "$last"
+      printf "${DIM} %-3s │ %-30s %1s │ %8s │  %-5s │ %-19s${RESET}\n" "$((i+1))" "$item" "$marker" "$size_disp" "$status" "$last"
     else
-                      printf " %-3s │ %-30s %1s │ %8s │  %-5s │ %-19s %1s\n" "$((i+1))" "$item" "$marker" "$size_disp" "$status" "$last"
+      printf " %-3s │ %-30s %1s │ %8s │  %-5s │ %-19s %1s\n" "$((i+1))" "$item" "$marker" "$size_disp" "$status" "$last"
     fi
 
   done
@@ -161,8 +166,15 @@ while true; do
         LAST_BACKUP["$item"]="$TIMESTAMP"
       done
 
-      # Update known items
-      printf "%s\n" "${HOME_ITEMS[@]}" > "$KNOWN_FILE"
+      # Update state file (timestamps & seen items)
+      {
+        for key in "${!LAST_BACKUP[@]}"; do
+          echo "last_backup:${key}=${LAST_BACKUP[$key]}"
+        done
+        for item in "${HOME_ITEMS[@]}"; do
+          echo "seen_item:${item}"
+        done
+      } > "$STATE_FILE"
 
       echo ""
       echo "✅ Backup complete!"
@@ -208,16 +220,21 @@ while true; do
       ;;
 
     [Qq])
-      # Save config and timestamps
+      # Save config selections
       > "$CONFIG_FILE"
       for key in "${!TO_BACKUP[@]}"; do
-        echo "$key=${TO_BACKUP[$key]}" >> "$CONFIG_FILE"
+        echo "${key}=${TO_BACKUP[$key]}" >> "$CONFIG_FILE"
       done
 
-      > "$TIMESTAMP_FILE"
-      for key in "${!LAST_BACKUP[@]}"; do
-        echo "$key=${LAST_BACKUP[$key]}" >> "$TIMESTAMP_FILE"
-      done
+      # Save state file (timestamps & seen items)
+      {
+        for key in "${!LAST_BACKUP[@]}"; do
+          echo "last_backup:${key}=${LAST_BACKUP[$key]}"
+        done
+        for item in "${HOME_ITEMS[@]}"; do
+          echo "seen_item:${item}"
+        done
+      } > "$STATE_FILE"
 
       echo "👋 Goodbye!"
       exit 0
